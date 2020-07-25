@@ -1,0 +1,118 @@
+FROM php:7.2.2-fpm
+
+# Container containing php-fpm and php-cli to run and interact with eZ Platform and other Symfony projects
+#
+# It has two modes of operation:
+# - (run.sh cmd) [default] Reconfigure eZ Platform/Publish based on provided env variables and start php-fpm
+# - (bash|php|composer) Allows to execute composer, php or bash against the image
+
+# Set defaults for variables used by run.sh
+ENV COMPOSER_HOME=/root/.composer
+
+# Get packages that we need in container
+RUN apt-get update -q -y \
+    && apt-get install -q -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    wget \
+    acl \
+    sudo \
+    python \
+    # Needed for the php extensions we enable below
+    libfreetype6 \
+    libjpeg62-turbo \
+    libxpm4 \
+    libpng16-16 \
+    libicu57 \
+    libxslt1.1 \
+    libmemcachedutil2 \
+    webp \
+    # git & unzip needed for composer, unless we document to use dev image for composer install
+    # unzip needed due to https://github.com/composer/composer/issues/4471
+    unzip \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install and configure php plugins
+RUN set -xe \
+    && buildDeps=" \
+    $PHP_EXTRA_BUILD_DEPS \
+    libfreetype6-dev \
+    libjpeg62-turbo-dev \
+    libxpm-dev \
+    libpng-dev \
+    libicu-dev \
+    libxslt1-dev \
+    libmemcached-dev \
+    " \
+    && apt-get update -q -y && apt-get install -q -y --no-install-recommends $buildDeps && rm -rf /var/lib/apt/lists/* \
+    # Extract php source and install missing extensions
+    && docker-php-source extract \
+    && docker-php-ext-configure mysqli --with-mysqli=mysqlnd \
+    && docker-php-ext-configure pdo_mysql --with-pdo-mysql=mysqlnd \
+    && docker-php-ext-configure gd --with-freetype-dir=/usr/include/ --with-jpeg-dir=/usr/include/ --with-png-dir=/usr/include/ --with-xpm-dir=/usr/include/ --enable-gd-native-ttf --enable-gd-jis-conv \
+    && docker-php-ext-install exif gd mbstring intl xsl zip mysqli pdo_mysql \
+    && docker-php-ext-enable opcache \
+    && cp /usr/src/php/php.ini-production ${PHP_INI_DIR}/php.ini \
+    \
+    # Install blackfire: https://blackfire.io/docs/integrations/docker
+    && version=$(php -r "echo PHP_MAJOR_VERSION.PHP_MINOR_VERSION;") \
+    && curl -A "Docker" -o /tmp/blackfire-probe.tar.gz -D - -L -s https://blackfire.io/api/v1/releases/probe/php/linux/amd64/$version \
+    && tar zxpf /tmp/blackfire-probe.tar.gz -C /tmp \
+    && mv /tmp/blackfire-*.so $(php -r "echo ini_get('extension_dir');")/blackfire.so \
+    && rm -f /tmp/blackfire-probe.tar.gz \
+    \
+    # Install msgpack (for more efficient serialization in redis/memcached)
+    && for i in $(seq 1 3); do pecl install -o msgpack && s=0 && break || s=$? && sleep 1; done; (exit $s) \
+    && docker-php-ext-enable msgpack \
+    \
+    # Install redis
+    && for i in $(seq 1 3); do pecl install -o redis && s=0 && break || s=$? && sleep 1; done; (exit $s) \
+    && docker-php-ext-enable redis \
+    \
+    # Install memcached (as we are on Debian 8 we have libmemcached 1.0.18 which is recommended)
+    && for i in $(seq 1 3); do echo no | pecl install -o memcached && s=0 && break || s=$? && sleep 1; done; (exit $s) \
+    && docker-php-ext-enable memcached \
+    \
+    # Delete source & builds deps so it does not hang around in layers taking up space
+    && docker-php-source delete \
+    && apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false $buildDeps
+
+# Set timezone
+RUN echo "UTC" > /etc/timezone && dpkg-reconfigure --frontend noninteractive tzdata
+
+# Set pid file to be able to restart php-fpm
+RUN sed -i "s@^\[global\]@\[global\]\n\npid = /run/php-fpm.pid@" ${PHP_INI_DIR}-fpm.conf
+
+COPY .docker/laravel-php/blackfire.ini ${PHP_INI_DIR}/conf.d/blackfire.ini
+
+# Create Composer directory (cache and auth files) & Get Composer
+RUN mkdir -p $COMPOSER_HOME \
+    && curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+
+
+RUN wget http://codeception.com/codecept.phar \
+    && chmod +x codecept.phar \
+    && mv codecept.phar /usr/local/bin/codecept
+
+# Install python & awscli to send emails
+RUN curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py \
+    && python get-pip.py \
+    && pip install awscli 
+
+# Install xdebug
+#RUN pecl install xdebug \
+#    && docker-php-ext-enable xdebug
+
+# Add some custom config
+COPY .docker/laravel-php/php.ini ${PHP_INI_DIR}/conf.d/php.ini
+
+# Needed for docker-machine
+RUN usermod -u 1000 www-data
+
+COPY . /var/www/html
+WORKDIR /var/www/html
+
+CMD php-fpm
+
+EXPOSE 9000
